@@ -12,6 +12,7 @@ import re
 from yt_dlp.postprocessor.common import PostProcessor
 
 import google_login
+import git_auth_sync
 
 # ─── FFmpeg Detection ─────────────────────────────────────────────────
 
@@ -129,6 +130,11 @@ def save_cookies(text: str) -> int:
         except OSError:
             pass
         google_login.record_authenticated(count)
+        if git_auth_sync.enabled():
+            try:
+                git_auth_sync.push(COOKIES_PATH, "sync YouTube auth")
+            except git_auth_sync.GitAuthError as exc:
+                print(f"[auth] Git sync upload failed: {exc}")
     return count
 
 
@@ -138,6 +144,11 @@ def clear_cookies():
             os.remove(COOKIES_PATH)
         except FileNotFoundError:
             pass
+        if git_auth_sync.enabled():
+            try:
+                git_auth_sync.remove_remote()
+            except git_auth_sync.GitAuthError as exc:
+                print(f"[auth] Git sync remote delete failed: {exc}")
 
 
 def cookies_info() -> dict:
