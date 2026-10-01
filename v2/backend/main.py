@@ -20,6 +20,7 @@ from downloader import (
     mark_auth_expired,
 )
 from google_login import LoginError, start_interactive_setup
+import git_auth_sync
 
 app = FastAPI(title="Video Downloader API")
 
@@ -40,6 +41,18 @@ app.add_middleware(
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 TEMP_DIR = os.path.join(BASE_DIR, "temp_downloads")
+
+@app.on_event("startup")
+async def restore_youtube_auth():
+    if not git_auth_sync.enabled():
+        return
+    try:
+        restored = await asyncio.to_thread(git_auth_sync.pull, __import__("downloader").COOKIES_PATH)
+        if restored:
+            print("[auth] Restored encrypted YouTube auth from Git.")
+    except git_auth_sync.GitAuthError as exc:
+        # Do not prevent the API from starting if the remote auth store is unavailable.
+        print(f"[auth] Git sync restore failed: {exc}")
 
 class AnalyzeRequest(BaseModel):
     url: str
