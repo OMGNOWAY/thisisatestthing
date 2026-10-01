@@ -1,0 +1,25 @@
+services:
+  - type: web
+    name: universal-downloader-api
+    env: docker
+    dockerfilePath: ./Dockerfile
+    plan: free
+    envVars:
+      - key: FRONTEND_URL
+        value: https://universal-downloader.vercel.app
+      # Secrets: set these in the Render dashboard (they are not stored in git)
+      - key: ADMIN_TOKEN
+        sync: false
+      - key: YOUTUBE_AUTH_DIR
+        value: /var/lib/myapp/youtube/auth
+      - key: YOUTUBE_COOKIE_FILE
+        value: /var/lib/myapp/youtube/auth/cookies.txt
+        sync: false
+      - key: DOWNLOAD_WORKERS
+        value: "2"
+      - key: DOWNLOAD_QUEUE_SIZE
+        value: "20"
+      - key: DOWNLOAD_QUEUE_TIMEOUT
+        value: "900"
+      - key: YOUTUBE_SESSION_CHECK_INTERVAL
+        value: "600"
