@@ -2,6 +2,7 @@ from fastapi import FastAPI, HTTPException, Request, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
+from typing import Any
 import os
 import time
 import asyncio
@@ -42,8 +43,91 @@ app.add_middleware(
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 TEMP_DIR = os.path.join(BASE_DIR, "temp_downloads")
 
+
+class DownloadQueue:
+    """In-memory FIFO queue for downloads that need a status before completion."""
+
+    def __init__(self, workers: int = 2):
+        self.workers = workers
+        self.pending: asyncio.Queue[str] = asyncio.Queue()
+        self.jobs: dict[str, dict[str, Any]] = {}
+        self.worker_tasks: list[asyncio.Task] = []
+
+    async def start(self):
+        if not self.worker_tasks:
+            self.worker_tasks = [asyncio.create_task(self._worker()) for _ in range(self.workers)]
+
+    async def stop(self):
+        for task in self.worker_tasks:
+            task.cancel()
+        if self.worker_tasks:
+            await asyncio.gather(*self.worker_tasks, return_exceptions=True)
+        self.worker_tasks = []
+
+    async def add(self, request: "DownloadRequest") -> dict[str, Any]:
+        job_id = __import__("uuid").uuid4().hex
+        job = {
+            "id": job_id,
+            "url": request.url,
+            "format_id": request.formatId,
+            "title": request.title,
+            "status": "queued",
+            "filepath": None,
+            "error": None,
+        }
+        self.jobs[job_id] = job
+        await self.pending.put(job_id)
+        return self.status(job_id)
+
+    def status(self, job_id: str) -> dict[str, Any]:
+        job = self.jobs.get(job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail="Download job not found.")
+        result = {"id": job_id, "status": job["status"]}
+        if job["status"] == "queued":
+            # asyncio.Queue exposes the FIFO contents; jobs already taken by a
+            # worker are no longer counted as waiting ahead of this caller.
+            result["queuePosition"] = list(self.pending._queue).index(job_id) + 1
+        if job["status"] == "failed":
+            result["error"] = job["error"]
+        if job["status"] == "ready":
+            result["downloadUrl"] = f"/api/download/jobs/{job_id}/file"
+        return result
+
+    async def _worker(self):
+        while True:
+            job_id = await self.pending.get()
+            job = self.jobs.get(job_id)
+            if not job:
+                self.pending.task_done()
+                continue
+            job["status"] = "downloading"
+            try:
+                os.makedirs(TEMP_DIR, exist_ok=True)
+                job["filepath"] = await asyncio.wait_for(
+                    download_video(job["url"], job["format_id"], TEMP_DIR), timeout=300
+                )
+                job["status"] = "ready"
+            except asyncio.TimeoutError:
+                job["status"] = "failed"
+                job["error"] = "Download timed out (5 min limit). Try a lower quality."
+            except Exception as exc:
+                print(f"[api] Queued download error for {job['url'][:60]}: {exc}")
+                traceback.print_exc()
+                job["status"] = "failed"
+                job["error"] = (
+                    "YouTube authentication has expired. Re-authentication is required."
+                    if needs_signin(exc) else "Download failed. Please try again."
+                )
+            finally:
+                self.pending.task_done()
+
+
+download_queue = DownloadQueue()
+
 @app.on_event("startup")
 async def restore_youtube_auth():
+    await download_queue.start()
     if not git_auth_sync.enabled():
         return
     try:
@@ -54,6 +138,11 @@ async def restore_youtube_auth():
         # Do not prevent the API from starting if the remote auth store is unavailable.
         print(f"[auth] Git sync restore failed: {exc}")
 
+
+@app.on_event("shutdown")
+async def stop_download_queue():
+    await download_queue.stop()
+
 class AnalyzeRequest(BaseModel):
     url: str
 
@@ -61,6 +150,45 @@ class DownloadRequest(BaseModel):
     url: str
     formatId: str
     title: str = ""
+
+
+@app.post("/api/download/jobs", status_code=202)
+async def queue_download(req: DownloadRequest, request: Request):
+    """Queue a download and return immediately with its FIFO queue position."""
+    check_rate_limit(request)
+    if not req.formatId:
+        raise HTTPException(status_code=400, detail="URL and formatId are required")
+    validate_public_url(req.url)
+    return await download_queue.add(req)
+
+
+@app.get("/api/download/jobs/{job_id}")
+async def get_download_job(job_id: str):
+    """Return a job's state and queue position while it is waiting."""
+    return download_queue.status(job_id)
+
+
+@app.get("/api/download/jobs/{job_id}/file")
+async def get_queued_download(job_id: str):
+    """Stream a completed queued download to the caller."""
+    job = download_queue.jobs.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Download job not found.")
+    if job["status"] == "failed":
+        raise HTTPException(status_code=500, detail=job["error"])
+    if job["status"] != "ready" or not job["filepath"]:
+        raise HTTPException(status_code=409, detail=download_queue.status(job_id))
+
+    filepath = job["filepath"]
+    ext = os.path.splitext(filepath)[1].lstrip('.') or "bin"
+    friendly_name = safe_filename(job["title"], ext)
+    return FileResponse(
+        path=filepath,
+        media_type=MIME_MAP.get(ext, "application/octet-stream"),
+        filename=friendly_name,
+        background=BackgroundTask(cleanup_job_dir, os.path.dirname(filepath)),
+        headers={"Content-Disposition": f'attachment; filename="{friendly_name}"'},
+    )
 
 rate_limits = {}
 rate_limits_lock = threading.Lock()

@@ -191,6 +191,44 @@ Download media in the selected format.
 
 Returns the binary file (MP4/MP3) with a `Content-Disposition` header.
 
+### Queued downloads
+
+For clients that need queue updates before the file is ready, create a job with
+`POST /api/download/jobs`. It returns `202 Accepted` and a JSON status object.
+When a job is waiting, `queuePosition` is its one-based position among the
+waiting jobs. No time estimate is returned. Poll `GET /api/download/jobs/{id}`
+until its status is `ready`, then download the binary from the returned
+`downloadUrl`. Statuses are `queued`, `downloading`, `ready`, and `failed`.
+
+```js
+const apiUrl = "http://localhost:8000";
+
+const created = await fetch(`${apiUrl}/api/download/jobs`, {
+  method: "POST",
+  headers: { "Content-Type": "application/json" },
+  body: JSON.stringify({
+    url: "https://youtube.com/watch?v=...",
+    formatId: "bestvideo+bestaudio/best",
+    title: "My video",
+  }),
+});
+
+let job = await created.json();
+while (job.status === "queued" || job.status === "downloading") {
+  if (job.status === "queued") {
+    console.log(`You are number ${job.queuePosition} in the download queue.`);
+  } else {
+    console.log("Your download is being prepared.");
+  }
+  await new Promise((resolve) => setTimeout(resolve, 1000));
+  job = await fetch(`${apiUrl}/api/download/jobs/${job.id}`).then((r) => r.json());
+}
+
+if (job.status === "failed") throw new Error(job.error);
+const file = await fetch(`${apiUrl}${job.downloadUrl}`).then((r) => r.blob());
+// Use `file`, e.g. URL.createObjectURL(file), to save or play it in the browser.
+```
+
 ### Security
 
 - Only `http`/`https` URLs are accepted, and hosts resolving to private,
