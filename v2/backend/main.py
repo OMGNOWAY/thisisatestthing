@@ -10,10 +10,10 @@ import shutil
 import re
 import socket
 import ipaddress
-import traceback
 import threading
 import urllib.parse
 import hmac
+import logging
 from starlette.background import BackgroundTask
 
 from downloader import (
@@ -24,6 +24,19 @@ from google_login import LoginError, start_interactive_setup
 import git_auth_sync
 
 app = FastAPI(title="Video Downloader API")
+
+# Render captures stdout/stderr, so these messages appear in the service's Log
+# tab. Do not log secrets or full URLs (they may contain signed query strings).
+if not logging.getLogger().handlers:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+logger = logging.getLogger("video_downloader")
+logger.setLevel(logging.INFO)
+
+
+def url_for_log(url: str) -> str:
+    """Return a useful but non-sensitive URL description for operational logs."""
+    parsed = urllib.parse.urlparse(url)
+    return f"{parsed.scheme}://{parsed.netloc}{parsed.path}" if parsed.netloc else "invalid-url"
 
 def get_allowed_origins(frontend_url: str | None = None) -> list[str]:
     configured = frontend_url if frontend_url is not None else os.getenv("FRONTEND_URL", "http://localhost:5173")
@@ -79,7 +92,9 @@ class DownloadQueue:
         }
         self.jobs[job_id] = job
         await self.pending.put(job_id)
-        return self.status(job_id)
+        status = self.status(job_id)
+        logger.info("Queued download job=%s position=%s url=%s", job_id, status.get("queuePosition"), url_for_log(request.url))
+        return status
 
     def status(self, job_id: str) -> dict[str, Any]:
         job = self.jobs.get(job_id)
@@ -101,21 +116,24 @@ class DownloadQueue:
             job_id = await self.pending.get()
             job = self.jobs.get(job_id)
             if not job:
+                logger.warning("Queue worker received missing job=%s", job_id)
                 self.pending.task_done()
                 continue
             job["status"] = "downloading"
+            logger.info("Download worker started job=%s url=%s", job_id, url_for_log(job["url"]))
             try:
                 os.makedirs(TEMP_DIR, exist_ok=True)
                 job["filepath"] = await asyncio.wait_for(
                     download_video(job["url"], job["format_id"], TEMP_DIR), timeout=300
                 )
                 job["status"] = "ready"
+                logger.info("Download worker completed job=%s", job_id)
             except asyncio.TimeoutError:
                 job["status"] = "failed"
                 job["error"] = "Download timed out (5 min limit). Try a lower quality."
+                logger.warning("Download worker timed out job=%s", job_id)
             except Exception as exc:
-                print(f"[api] Queued download error for {job['url'][:60]}: {exc}")
-                traceback.print_exc()
+                logger.exception("Download worker failed job=%s url=%s", job_id, url_for_log(job["url"]))
                 job["status"] = "failed"
                 job["error"] = (
                     "YouTube authentication has expired. Re-authentication is required."
@@ -130,19 +148,22 @@ download_queue = DownloadQueue()
 @app.on_event("startup")
 async def restore_youtube_auth():
     await download_queue.start()
+    logger.info("Download queue started workers=%s", download_queue.workers)
     if not git_auth_sync.enabled():
+        logger.info("Git-backed YouTube auth restore is disabled")
         return
     try:
         restored = await asyncio.to_thread(git_auth_sync.pull, __import__("downloader").COOKIES_PATH)
         if restored:
-            print("[auth] Restored encrypted YouTube auth from Git.")
+            logger.info("Restored encrypted YouTube auth from Git")
     except git_auth_sync.GitAuthError as exc:
         # Do not prevent the API from starting if the remote auth store is unavailable.
-        print(f"[auth] Git sync restore failed: {exc}")
+        logger.warning("Git sync auth restore failed: %s", exc)
 
 
 @app.on_event("shutdown")
 async def stop_download_queue():
+    logger.info("Stopping download queue")
     await download_queue.stop()
 
 class AnalyzeRequest(BaseModel):
@@ -167,7 +188,9 @@ async def queue_download(req: DownloadRequest, request: Request):
 @app.get("/api/download/jobs/{job_id}")
 async def get_download_job(job_id: str):
     """Return a job's state and queue position while it is waiting."""
-    return download_queue.status(job_id)
+    status = download_queue.status(job_id)
+    logger.info("Download job status requested job=%s status=%s", job_id, status["status"])
+    return status
 
 
 @app.get("/api/download/jobs/{job_id}/file")
@@ -177,13 +200,16 @@ async def get_queued_download(job_id: str):
     if not job:
         raise HTTPException(status_code=404, detail="Download job not found.")
     if job["status"] == "failed":
+        logger.warning("Failed download file requested job=%s", job_id)
         raise HTTPException(status_code=500, detail=job["error"])
     if job["status"] != "ready" or not job["filepath"]:
+        logger.info("Unready download file requested job=%s status=%s", job_id, job["status"])
         raise HTTPException(status_code=409, detail=download_queue.status(job_id))
 
     filepath = job["filepath"]
     ext = os.path.splitext(filepath)[1].lstrip('.') or "bin"
     friendly_name = safe_filename(job["title"], ext)
+    logger.info("Serving queued download file job=%s filename=%s", job_id, friendly_name)
     return FileResponse(
         path=filepath,
         media_type=MIME_MAP.get(ext, "application/octet-stream"),
@@ -311,18 +337,20 @@ async def run_analyze(url: str):
 async def api_analyze(req: AnalyzeRequest, request: Request):
     check_rate_limit(request)
     validate_public_url(req.url)
+    logger.info("Analyze started url=%s", url_for_log(req.url))
     try:
         data = await run_analyze(req.url)
         if not data:
             raise HTTPException(status_code=400, detail="Could not extract metadata from this URL")
+        logger.info("Analyze completed url=%s formats=%s", url_for_log(req.url), len(data.get("formats", [])))
         return data
     except asyncio.TimeoutError:
+        logger.warning("Analyze timed out url=%s", url_for_log(req.url))
         raise HTTPException(status_code=408, detail="Analysis timed out. Please try again.")
     except HTTPException:
         raise
     except Exception as e:
-        print(f"[api] Analyze error for {req.url[:60]}: {e}")
-        traceback.print_exc()
+        logger.exception("Analyze failed url=%s", url_for_log(req.url))
         if needs_signin(e):
             mark_auth_expired()
             raise HTTPException(status_code=401, detail="YouTube authentication has expired. Re-authentication is required.")
@@ -334,6 +362,7 @@ async def api_download(req: DownloadRequest, request: Request):
     if not req.formatId:
         raise HTTPException(status_code=400, detail="URL and formatId are required")
     validate_public_url(req.url)
+    logger.info("Direct download started url=%s", url_for_log(req.url))
 
     try:
         os.makedirs(TEMP_DIR, exist_ok=True)
@@ -347,6 +376,7 @@ async def api_download(req: DownloadRequest, request: Request):
         friendly_name = safe_filename(req.title, ext)
 
         job_dir = os.path.dirname(filepath)
+        logger.info("Direct download completed url=%s filename=%s", url_for_log(req.url), friendly_name)
 
         return FileResponse(
             path=filepath,
@@ -359,10 +389,10 @@ async def api_download(req: DownloadRequest, request: Request):
         )
 
     except asyncio.TimeoutError:
+        logger.warning("Direct download timed out url=%s", url_for_log(req.url))
         raise HTTPException(status_code=408, detail="Download timed out (5 min limit). Try a lower quality.")
     except Exception as e:
-        print(f"[api] Download error for {req.url[:60]}: {e}")
-        traceback.print_exc()
+        logger.exception("Direct download failed url=%s", url_for_log(req.url))
         if needs_signin(e):
             mark_auth_expired()
             raise HTTPException(status_code=401, detail="YouTube authentication has expired. Re-authentication is required.")

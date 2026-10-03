@@ -5,14 +5,23 @@ import asyncio
 import shutil
 import threading
 import time
-import traceback
 import contextlib
 import tempfile
 import re
+import logging
 from yt_dlp.postprocessor.common import PostProcessor
 
 import google_login
 import git_auth_sync
+
+logger = logging.getLogger("video_downloader.downloader")
+
+
+def _url_for_log(url: str) -> str:
+    """Avoid logging URL query strings, which can contain temporary tokens."""
+    from urllib.parse import urlparse
+    parsed = urlparse(url)
+    return f"{parsed.scheme}://{parsed.netloc}{parsed.path}" if parsed.netloc else "invalid-url"
 
 # ─── FFmpeg Detection ─────────────────────────────────────────────────
 
@@ -22,13 +31,13 @@ _FFMPEG_EXE = os.path.join(_FFMPEG_BUNDLED, 'ffmpeg.exe')
 
 if os.path.isfile(_FFMPEG_EXE):
     FFMPEG_LOCATION = _FFMPEG_BUNDLED
-    print(f"[downloader] Using bundled FFmpeg: {FFMPEG_LOCATION}")
+    logger.info("Using bundled FFmpeg at %s", FFMPEG_LOCATION)
 elif shutil.which('ffmpeg'):
     FFMPEG_LOCATION = os.path.dirname(shutil.which('ffmpeg'))
-    print(f"[downloader] Using system FFmpeg: {FFMPEG_LOCATION}")
+    logger.info("Using system FFmpeg at %s", FFMPEG_LOCATION)
 else:
     FFMPEG_LOCATION = None
-    print("[downloader] WARNING: FFmpeg not found! Audio merging will not work.")
+    logger.warning("FFmpeg not found; audio conversion and merging will not work")
 
 HAS_FFMPEG = FFMPEG_LOCATION is not None
 
@@ -134,7 +143,7 @@ def save_cookies(text: str) -> int:
             try:
                 git_auth_sync.push(COOKIES_PATH, "sync YouTube auth")
             except git_auth_sync.GitAuthError as exc:
-                print(f"[auth] Git sync upload failed: {exc}")
+                logger.warning("Git sync auth upload failed: %s", exc)
     return count
 
 
@@ -148,7 +157,7 @@ def clear_cookies():
             try:
                 git_auth_sync.remove_remote()
             except git_auth_sync.GitAuthError as exc:
-                print(f"[auth] Git sync remote delete failed: {exc}")
+                logger.warning("Git sync auth delete failed: %s", exc)
 
 
 def cookies_info() -> dict:
@@ -285,6 +294,7 @@ def analyze_url(url: str):
     platform_info = detect_platform(url)
     platform = platform_info["platform"]
     content_type = platform_info["type"]
+    logger.info("yt-dlp analysis started platform=%s type=%s url=%s", platform, content_type, _url_for_log(url))
 
     label_map = {
         "youtube": "Short" if content_type == "short" else "Video",
@@ -305,6 +315,7 @@ def analyze_url(url: str):
                 if not info:
                     return None
                 formats = _build_formats(info, label_map[platform], is_short=is_short)
+                logger.info("yt-dlp analysis completed platform=%s formats=%s", platform, len(formats))
                 return {
                     "platform": platform,
                     "contentType": content_type,
@@ -314,6 +325,7 @@ def analyze_url(url: str):
                     "formats": formats,
                 }
             except Exception as e:
+                logger.exception("yt-dlp analysis failed platform=%s url=%s", platform, _url_for_log(url))
                 raise Exception(f"Failed to analyze URL: {e}")
 
 
@@ -331,6 +343,10 @@ async def download_video(url: str, format_id: str, output_dir: str):
 
     is_audio_only = (
         'bestaudio' in format_id and 'bestvideo' not in format_id
+    )
+    logger.info(
+        "yt-dlp download prepared job=%s platform=%s audio_only=%s url=%s",
+        job_id, detect_platform(url)["platform"], is_audio_only, _url_for_log(url)
     )
 
     opts = _base_opts()
@@ -378,7 +394,9 @@ async def download_video(url: str, format_id: str, output_dir: str):
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             def _run():
+                logger.info("yt-dlp download waiting for worker slot job=%s attempt=%s", job_id, attempt)
                 with _DL_SEM:
+                    logger.info("yt-dlp download started job=%s attempt=%s", job_id, attempt)
                     with _cookie_copy(platform) as cookie_tmp:
                         run_opts = dict(opts)
                         if cookie_tmp:
@@ -387,6 +405,7 @@ async def download_video(url: str, format_id: str, output_dir: str):
                             if is_audio_only and HAS_FFMPEG:
                                 ydl.add_post_processor(_CleanTagsPP(), when='pre_process')
                             ydl.download([url])
+                logger.info("yt-dlp download finished processing job=%s attempt=%s", job_id, attempt)
 
             await asyncio.to_thread(_run)
 
@@ -394,13 +413,14 @@ async def download_video(url: str, format_id: str, output_dir: str):
             for fname in os.listdir(job_dir):
                 full = os.path.join(job_dir, fname)
                 if os.path.isfile(full) and not fname.endswith(('.part', '.ytdl', '.temp', '.jpg', '.jpeg', '.png', '.webp')):
+                    logger.info("yt-dlp output found job=%s extension=%s", job_id, os.path.splitext(fname)[1])
                     return full
 
             raise FileNotFoundError("Downloaded file not found in job directory")
 
         except Exception as e:
             last_err = e
-            print(f"[downloader] Attempt {attempt}/{MAX_RETRIES} failed for {url[:60]}: {e}")
+            logger.exception("yt-dlp download failed job=%s attempt=%s/%s url=%s", job_id, attempt, MAX_RETRIES, _url_for_log(url))
             if attempt < MAX_RETRIES:
                 # Clean up partial files before retry
                 for fname in os.listdir(job_dir):
@@ -410,4 +430,5 @@ async def download_video(url: str, format_id: str, output_dir: str):
                         pass
                 await asyncio.sleep(RETRY_DELAY * attempt)  # progressive backoff
 
+    logger.error("yt-dlp download exhausted retries job=%s url=%s", job_id, _url_for_log(url))
     raise Exception(f"Download failed after {MAX_RETRIES} attempts: {last_err}")
