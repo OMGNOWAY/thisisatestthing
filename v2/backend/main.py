@@ -37,7 +37,9 @@ app.add_middleware(
     allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
-    expose_headers=["Content-Disposition"],
+    # Browser JavaScript needs these headers to read the suggested filename
+    # and calculate streamed download progress from Content-Length.
+    expose_headers=["Content-Disposition", "Content-Length"],
 )
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
