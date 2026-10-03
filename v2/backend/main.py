@@ -73,7 +73,7 @@ def positive_int_env(name: str, default: int) -> int:
 # slow. Limiting simultaneous analyses prevents several expensive extracts from
 # starving one another on small Render instances.
 ANALYZE_TIMEOUT_SECONDS = positive_int_env("ANALYZE_TIMEOUT_SECONDS", 120)
-ANALYZE_CONCURRENCY = positive_int_env("ANALYZE_CONCURRENCY", 2)
+ANALYZE_CONCURRENCY = positive_int_env("ANALYZE_CONCURRENCY", 1)
 analyze_semaphore = asyncio.Semaphore(ANALYZE_CONCURRENCY)
 
 
