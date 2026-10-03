@@ -59,6 +59,24 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 TEMP_DIR = os.path.join(BASE_DIR, "temp_downloads")
 
 
+def positive_int_env(name: str, default: int) -> int:
+    """Read a positive integer setting without making a bad env value fatal."""
+    try:
+        value = int(os.getenv(name, str(default)))
+        return value if value > 0 else default
+    except ValueError:
+        logger.warning("Invalid %s value; using default %s", name, default)
+        return default
+
+
+# yt-dlp may need more than 45 seconds after a cold start or when YouTube is
+# slow. Limiting simultaneous analyses prevents several expensive extracts from
+# starving one another on small Render instances.
+ANALYZE_TIMEOUT_SECONDS = positive_int_env("ANALYZE_TIMEOUT_SECONDS", 120)
+ANALYZE_CONCURRENCY = positive_int_env("ANALYZE_CONCURRENCY", 2)
+analyze_semaphore = asyncio.Semaphore(ANALYZE_CONCURRENCY)
+
+
 class DownloadQueue:
     """In-memory FIFO queue for downloads that need a status before completion."""
 
@@ -331,7 +349,12 @@ def needs_signin(err: Exception) -> bool:
     return "not a bot" in msg or "cookies are no longer valid" in msg
 
 async def run_analyze(url: str):
-    return await asyncio.wait_for(asyncio.to_thread(analyze_url, url), timeout=45)
+    logger.info("Analyze waiting for slot url=%s", url_for_log(url))
+    async with analyze_semaphore:
+        logger.info("Analyze worker started timeout=%ss url=%s", ANALYZE_TIMEOUT_SECONDS, url_for_log(url))
+        return await asyncio.wait_for(
+            asyncio.to_thread(analyze_url, url), timeout=ANALYZE_TIMEOUT_SECONDS
+        )
 
 @app.post("/api/analyze")
 async def api_analyze(req: AnalyzeRequest, request: Request):
