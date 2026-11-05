@@ -41,9 +41,9 @@ else:
 
 HAS_FFMPEG = FFMPEG_LOCATION is not None
 
-# Only 2 concurrent yt-dlp+FFmpeg processes at a time (Windows file lock prevention).
+# Only 1 concurrent yt-dlp+FFmpeg process at a time (512MB RAM hosting).
 # threading.Semaphore because _run() executes inside asyncio.to_thread().
-_DL_SEM = threading.Semaphore(2)
+_DL_SEM = threading.Semaphore(1)
 
 # TLS certificate verification is kept enabled by default; the legacy bypass
 # (some corporate networks use MITM proxies with custom CAs) can be re-enabled
