@@ -16,7 +16,7 @@ services:
         value: /var/lib/myapp/youtube/auth/cookies.txt
         sync: false
       - key: DOWNLOAD_WORKERS
-        value: "2"
+        value: "1"
       - key: DOWNLOAD_QUEUE_SIZE
         value: "20"
       - key: DOWNLOAD_QUEUE_TIMEOUT
