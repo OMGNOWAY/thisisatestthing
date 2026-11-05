@@ -463,6 +463,7 @@ async def download_video(url: str, format_id: str, output_dir: str):
             )
 
     last_err = None
+    saw_forbidden = False
     attempts = audio_formats if audio_formats else [None] * MAX_RETRIES
     for attempt, selected in enumerate(attempts, start=1):
         selected_id = str(selected['format_id']) if selected else None
@@ -487,6 +488,7 @@ async def download_video(url: str, format_id: str, output_dir: str):
             last_err = exc
             message = str(exc)
             forbidden = "HTTP Error 403" in message or "403: Forbidden" in message
+            saw_forbidden = saw_forbidden or forbidden
             unavailable = "Requested format is not available" in message
             logger.warning(
                 "Download attempt failed job=%s attempt=%s format=%s reason=%s",
@@ -511,7 +513,7 @@ async def download_video(url: str, format_id: str, output_dir: str):
                 await asyncio.sleep(RETRY_DELAY * attempt)
 
     shutil.rmtree(job_dir, ignore_errors=True)
-    if last_err and ("HTTP Error 403" in str(last_err) or "403: Forbidden" in str(last_err)):
+    if saw_forbidden:
         raise RuntimeError(
             "YouTube refused the available audio stream(s) (HTTP 403). "
             "This may be an upstream access restriction, not an MP3 conversion problem."
