@@ -404,14 +404,29 @@ async def download_video(url: str, format_id: str, output_dir: str):
                             # When a YouTube CDN audio URL is rejected, try its
                             # HLS audio stream instead, if one is available.
                             # web_safari exposes HLS formats on some videos.
-                            run_opts['format'] = 'bestaudio[protocol*=m3u8]'
                             run_opts['extractor_args'] = {
                                 'youtube': {'player_client': ['web_safari']}
                             }
-                            logger.info("Trying YouTube HLS audio fallback job=%s", job_id)
+                            logger.info("Checking available YouTube HLS audio formats job=%s", job_id)
                         if cookie_tmp:
                             run_opts['cookiefile'] = cookie_tmp
                         with yt_dlp.YoutubeDL(run_opts) as ydl:
+                            if use_hls_fallback:
+                                info = ydl.extract_info(url, download=False)
+                                candidates = [
+                                    f for f in (info or {}).get('formats', [])
+                                    if 'm3u8' in str(f.get('protocol', ''))
+                                    and f.get('acodec', 'none') != 'none'
+                                    and f.get('vcodec', 'none') == 'none'
+                                    and f.get('format_id')
+                                ]
+                                if not candidates:
+                                    raise RuntimeError("No HLS audio format available for this YouTube video")
+                                selected = max(
+                                    candidates, key=lambda f: (f.get('abr') or f.get('tbr') or 0)
+                                )
+                                ydl.params['format'] = str(selected['format_id'])
+                                logger.info("Using available HLS audio format job=%s", job_id)
                             if is_audio_only and HAS_FFMPEG:
                                 ydl.add_post_processor(_CleanTagsPP(), when='pre_process')
                             ydl.download([url])
@@ -454,6 +469,9 @@ async def download_video(url: str, format_id: str, output_dir: str):
                     "and whether the hosting IP is allowed to fetch the media.",
                     job_id,
                 )
+                break
+            if "No HLS audio format available" in str(e) or "Requested format is not available" in str(e):
+                logger.warning("No usable alternative audio format job=%s; stopping retries", job_id)
                 break
             if attempt < MAX_RETRIES:
                 # Clean up partial files before retry
