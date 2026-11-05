@@ -80,7 +80,7 @@ analyze_semaphore = asyncio.Semaphore(ANALYZE_CONCURRENCY)
 class DownloadQueue:
     """In-memory FIFO queue for downloads that need a status before completion."""
 
-    def __init__(self, workers: int = 2):
+    def __init__(self, workers: int = 1):
         self.workers = workers
         self.pending: asyncio.Queue[str] = asyncio.Queue()
         self.jobs: dict[str, dict[str, Any]] = {}
