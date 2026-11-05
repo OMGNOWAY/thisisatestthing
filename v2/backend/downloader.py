@@ -391,6 +391,7 @@ async def download_video(url: str, format_id: str, output_dir: str):
     platform = detect_platform(url)["platform"]
 
     last_err = None
+    use_hls_fallback = False
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             def _run():
@@ -399,6 +400,15 @@ async def download_video(url: str, format_id: str, output_dir: str):
                     logger.info("yt-dlp download started job=%s attempt=%s", job_id, attempt)
                     with _cookie_copy(platform) as cookie_tmp:
                         run_opts = dict(opts)
+                        if use_hls_fallback:
+                            # When a YouTube CDN audio URL is rejected, try its
+                            # HLS audio stream instead, if one is available.
+                            # web_safari exposes HLS formats on some videos.
+                            run_opts['format'] = 'bestaudio[protocol*=m3u8]'
+                            run_opts['extractor_args'] = {
+                                'youtube': {'player_client': ['web_safari']}
+                            }
+                            logger.info("Trying YouTube HLS audio fallback job=%s", job_id)
                         if cookie_tmp:
                             run_opts['cookiefile'] = cookie_tmp
                         with yt_dlp.YoutubeDL(run_opts) as ydl:
@@ -424,6 +434,20 @@ async def download_video(url: str, format_id: str, output_dir: str):
             # YouTube explicitly rejected the media URL. Repeating the same
             # request generally won't help and wastes resources on small hosts.
             if "HTTP Error 403" in str(e) or "403: Forbidden" in str(e):
+                if platform == 'youtube' and is_audio_only and not use_hls_fallback:
+                    # Retry only with a genuinely different transport, not the
+                    # same forbidden direct media URL.
+                    for fname in os.listdir(job_dir):
+                        try:
+                            os.remove(os.path.join(job_dir, fname))
+                        except OSError:
+                            pass
+                    use_hls_fallback = True
+                    logger.warning(
+                        "YouTube audio CDN returned 403; retrying with HLS job=%s",
+                        job_id,
+                    )
+                    continue
                 logger.error(
                     "YouTube refused the media download (403) job=%s. "
                     "Verify yt-dlp/EJS versions, selected player client, auth cookies, "
