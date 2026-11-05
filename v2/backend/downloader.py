@@ -421,6 +421,16 @@ async def download_video(url: str, format_id: str, output_dir: str):
         except Exception as e:
             last_err = e
             logger.exception("yt-dlp download failed job=%s attempt=%s/%s url=%s", job_id, attempt, MAX_RETRIES, _url_for_log(url))
+            # YouTube explicitly rejected the media URL. Repeating the same
+            # request generally won't help and wastes resources on small hosts.
+            if "HTTP Error 403" in str(e) or "403: Forbidden" in str(e):
+                logger.error(
+                    "YouTube refused the media download (403) job=%s. "
+                    "Verify yt-dlp/EJS versions, selected player client, auth cookies, "
+                    "and whether the hosting IP is allowed to fetch the media.",
+                    job_id,
+                )
+                break
             if attempt < MAX_RETRIES:
                 # Clean up partial files before retry
                 for fname in os.listdir(job_dir):
@@ -430,5 +440,13 @@ async def download_video(url: str, format_id: str, output_dir: str):
                         pass
                 await asyncio.sleep(RETRY_DELAY * attempt)  # progressive backoff
 
-    logger.error("yt-dlp download exhausted retries job=%s url=%s", job_id, _url_for_log(url))
+    # Failed jobs must not occupy disk indefinitely. Successful outputs remain
+    # until the HTTP response finishes, and are cleaned up by the API layer.
+    shutil.rmtree(job_dir, ignore_errors=True)
+    logger.error("yt-dlp download failed job=%s url=%s", job_id, _url_for_log(url))
+    if "HTTP Error 403" in str(last_err) or "403: Forbidden" in str(last_err):
+        raise Exception(
+            "YouTube returned HTTP 403 when fetching audio. "
+            "The media request was refused; check yt-dlp/EJS, cookies, and Render IP access."
+        ) from last_err
     raise Exception(f"Download failed after {MAX_RETRIES} attempts: {last_err}")
