@@ -390,105 +390,136 @@ async def download_video(url: str, format_id: str, output_dir: str):
 
     platform = detect_platform(url)["platform"]
 
-    last_err = None
-    use_hls_fallback = False
-    for attempt in range(1, MAX_RETRIES + 1):
+    # Inspect the formats actually exposed by this video. The previous
+    # fallback forced an HLS format even when no HLS stream existed.
+    def _available_audio_formats():
+        with _cookie_copy(platform) as cookie_tmp:
+            probe_opts = _base_opts()
+            if cookie_tmp:
+                probe_opts['cookiefile'] = cookie_tmp
+            with yt_dlp.YoutubeDL(probe_opts) as probe:
+                info = probe.extract_info(url, download=False) or {}
+        candidates = [
+            f for f in info.get('formats', [])
+            if f.get('format_id')
+            and f.get('acodec') not in (None, 'none')
+            and f.get('vcodec', 'none') == 'none'
+            and f.get('url')
+        ]
+        candidates.sort(
+            key=lambda f: (
+                float(f.get('abr') or f.get('tbr') or 0),
+                float(f.get('asr') or 0),
+            ),
+            reverse=True,
+        )
+        # Try different streams rather than re-requesting the same forbidden
+        # CDN URL. Avoid near-identical formats when possible.
+        distinct = []
+        seen = set()
+        for f in candidates:
+            signature = (f.get('protocol'), f.get('acodec'))
+            if signature in seen:
+                continue
+            seen.add(signature)
+            distinct.append(f)
+        # Other bitrates of the same codec are still valid alternatives.
+        distinct.extend(f for f in candidates if f not in distinct)
+        return distinct[:3], len(candidates)
+
+    def _download_once(selected_id, attempt):
+        logger.info("yt-dlp download waiting for worker slot job=%s attempt=%s", job_id, attempt)
+        with _DL_SEM:
+            with _cookie_copy(platform) as cookie_tmp:
+                run_opts = dict(opts)
+                if selected_id:
+                    run_opts['format'] = selected_id
+                if cookie_tmp:
+                    run_opts['cookiefile'] = cookie_tmp
+                with yt_dlp.YoutubeDL(run_opts) as ydl:
+                    if is_audio_only and HAS_FFMPEG:
+                        ydl.add_post_processor(_CleanTagsPP(), when='pre_process')
+                    ydl.download([url])
+
+    audio_formats = []
+    if platform == 'youtube' and is_audio_only:
+        # Do not hold a worker slot while awaiting a previous download: the
+        # semaphore covers extraction and FFmpeg for each download attempt.
         try:
-            def _run():
-                logger.info("yt-dlp download waiting for worker slot job=%s attempt=%s", job_id, attempt)
-                with _DL_SEM:
-                    logger.info("yt-dlp download started job=%s attempt=%s", job_id, attempt)
-                    with _cookie_copy(platform) as cookie_tmp:
-                        run_opts = dict(opts)
-                        if use_hls_fallback:
-                            # When a YouTube CDN audio URL is rejected, try its
-                            # HLS audio stream instead, if one is available.
-                            # web_safari exposes HLS formats on some videos.
-                            run_opts['extractor_args'] = {
-                                'youtube': {'player_client': ['web_safari']}
-                            }
-                            logger.info("Checking available YouTube HLS audio formats job=%s", job_id)
-                        if cookie_tmp:
-                            run_opts['cookiefile'] = cookie_tmp
-                        with yt_dlp.YoutubeDL(run_opts) as ydl:
-                            if use_hls_fallback:
-                                info = ydl.extract_info(url, download=False)
-                                candidates = [
-                                    f for f in (info or {}).get('formats', [])
-                                    if 'm3u8' in str(f.get('protocol', ''))
-                                    and f.get('acodec', 'none') != 'none'
-                                    and f.get('vcodec', 'none') == 'none'
-                                    and f.get('format_id')
-                                ]
-                                if not candidates:
-                                    raise RuntimeError("No HLS audio format available for this YouTube video")
-                                selected = max(
-                                    candidates, key=lambda f: (f.get('abr') or f.get('tbr') or 0)
-                                )
-                                ydl.params['format'] = str(selected['format_id'])
-                                logger.info("Using available HLS audio format job=%s", job_id)
-                            if is_audio_only and HAS_FFMPEG:
-                                ydl.add_post_processor(_CleanTagsPP(), when='pre_process')
-                            ydl.download([url])
-                logger.info("yt-dlp download finished processing job=%s attempt=%s", job_id, attempt)
+            audio_formats, available_count = await asyncio.to_thread(_available_audio_formats)
+            logger.info(
+                "YouTube audio formats discovered job=%s available=%s attempts=%s",
+                job_id, available_count, len(audio_formats),
+            )
+        except Exception:
+            logger.exception("YouTube audio format inspection failed job=%s", job_id)
+            shutil.rmtree(job_dir, ignore_errors=True)
+            raise
+        if not audio_formats:
+            shutil.rmtree(job_dir, ignore_errors=True)
+            raise RuntimeError(
+                "YouTube did not expose a downloadable audio-only format "
+                "for this video. Check the playback session and yt-dlp configuration."
+            )
 
-            await asyncio.to_thread(_run)
-
-            # Find the produced file
+    last_err = None
+    attempts = audio_formats if audio_formats else [None] * MAX_RETRIES
+    for attempt, selected in enumerate(attempts, start=1):
+        selected_id = str(selected['format_id']) if selected else None
+        if selected:
+            logger.info(
+                "Audio format selected job=%s attempt=%s id=%s codec=%s "
+                "protocol=%s bitrate_kbps=%s",
+                job_id, attempt, selected_id, selected.get('acodec'),
+                selected.get('protocol'), selected.get('abr') or selected.get('tbr'),
+            )
+        try:
+            await asyncio.to_thread(_download_once, selected_id, attempt)
+            # Return only a finished media file; never a partial download.
             for fname in os.listdir(job_dir):
                 full = os.path.join(job_dir, fname)
-                if os.path.isfile(full) and not fname.endswith(('.part', '.ytdl', '.temp', '.jpg', '.jpeg', '.png', '.webp')):
-                    logger.info("yt-dlp output found job=%s extension=%s", job_id, os.path.splitext(fname)[1])
+                if (os.path.isfile(full)
+                        and not fname.endswith(('.part', '.ytdl', '.temp', '.jpg', '.jpeg', '.png', '.webp'))):
+                    logger.info("yt-dlp completed job=%s extension=%s", job_id, os.path.splitext(fname)[1])
                     return full
-
             raise FileNotFoundError("Downloaded file not found in job directory")
-
-        except Exception as e:
-            last_err = e
-            logger.exception("yt-dlp download failed job=%s attempt=%s/%s url=%s", job_id, attempt, MAX_RETRIES, _url_for_log(url))
-            # YouTube explicitly rejected the media URL. Repeating the same
-            # request generally won't help and wastes resources on small hosts.
-            if "HTTP Error 403" in str(e) or "403: Forbidden" in str(e):
-                if platform == 'youtube' and is_audio_only and not use_hls_fallback:
-                    # Retry only with a genuinely different transport, not the
-                    # same forbidden direct media URL.
-                    for fname in os.listdir(job_dir):
-                        try:
-                            os.remove(os.path.join(job_dir, fname))
-                        except OSError:
-                            pass
-                    use_hls_fallback = True
-                    logger.warning(
-                        "YouTube audio CDN returned 403; retrying with HLS job=%s",
-                        job_id,
-                    )
-                    continue
-                logger.error(
-                    "YouTube refused the media download (403) job=%s. "
-                    "Verify yt-dlp/EJS versions, selected player client, auth cookies, "
-                    "and whether the hosting IP is allowed to fetch the media.",
-                    job_id,
-                )
-                break
-            if "No HLS audio format available" in str(e) or "Requested format is not available" in str(e):
-                logger.warning("No usable alternative audio format job=%s; stopping retries", job_id)
+        except Exception as exc:
+            last_err = exc
+            message = str(exc)
+            forbidden = "HTTP Error 403" in message or "403: Forbidden" in message
+            unavailable = "Requested format is not available" in message
+            logger.warning(
+                "Download attempt failed job=%s attempt=%s format=%s reason=%s",
+                job_id, attempt, selected_id or "default",
+                "HTTP 403" if forbidden else "format unavailable" if unavailable else type(exc).__name__,
+            )
+            # Remove partial files before attempting an alternative.
+            for fname in os.listdir(job_dir):
+                try:
+                    os.remove(os.path.join(job_dir, fname))
+                except OSError:
+                    pass
+            if platform == 'youtube' and is_audio_only:
+                # Only retry a different format on a rejected or unavailable
+                # stream. Other errors should surface immediately.
+                if not (forbidden or unavailable):
+                    break
+                continue
+            if forbidden or unavailable:
                 break
             if attempt < MAX_RETRIES:
-                # Clean up partial files before retry
-                for fname in os.listdir(job_dir):
-                    try:
-                        os.remove(os.path.join(job_dir, fname))
-                    except Exception:
-                        pass
-                await asyncio.sleep(RETRY_DELAY * attempt)  # progressive backoff
+                await asyncio.sleep(RETRY_DELAY * attempt)
 
-    # Failed jobs must not occupy disk indefinitely. Successful outputs remain
-    # until the HTTP response finishes, and are cleaned up by the API layer.
     shutil.rmtree(job_dir, ignore_errors=True)
-    logger.error("yt-dlp download failed job=%s url=%s", job_id, _url_for_log(url))
-    if "HTTP Error 403" in str(last_err) or "403: Forbidden" in str(last_err):
-        raise Exception(
-            "YouTube returned HTTP 403 when fetching audio. "
-            "The media request was refused; check yt-dlp/EJS, cookies, and Render IP access."
+    if last_err and ("HTTP Error 403" in str(last_err) or "403: Forbidden" in str(last_err)):
+        raise RuntimeError(
+            "YouTube refused the available audio stream(s) (HTTP 403). "
+            "This may be an upstream access restriction, not an MP3 conversion problem."
         ) from last_err
-    raise Exception(f"Download failed after {MAX_RETRIES} attempts: {last_err}")
+    if platform == 'youtube' and is_audio_only and last_err and (
+        "Requested format is not available" in str(last_err)
+    ):
+        raise RuntimeError(
+            "YouTube's advertised audio formats became unavailable during download."
+        ) from last_err
+    raise RuntimeError(f"Download failed: {last_err}") from last_err
