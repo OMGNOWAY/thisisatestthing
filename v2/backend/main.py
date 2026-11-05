@@ -155,7 +155,10 @@ class DownloadQueue:
                 job["status"] = "failed"
                 job["error"] = (
                     "YouTube authentication has expired. Re-authentication is required."
-                    if needs_signin(exc) else "Download failed. Please try again."
+                    if needs_signin(exc)
+                    else "YouTube refused the audio download (HTTP 403). Please try again later."
+                    if "403" in str(exc)
+                    else "Download failed. Please try again."
                 )
             finally:
                 self.pending.task_done()
@@ -419,6 +422,8 @@ async def api_download(req: DownloadRequest, request: Request):
         if needs_signin(e):
             mark_auth_expired()
             raise HTTPException(status_code=401, detail="YouTube authentication has expired. Re-authentication is required.")
+        if "403" in str(e):
+            raise HTTPException(status_code=502, detail="YouTube refused the audio download (HTTP 403). Please try again later.")
         raise HTTPException(status_code=500, detail="Download failed. Please try again.")
 
 
