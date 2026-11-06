@@ -24,6 +24,7 @@ import yt_dlp
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
+from starlette.background import BackgroundTask
 from pydantic import BaseModel
 
 import git_auth_sync
@@ -38,8 +39,21 @@ if DENO.is_file():
 os.environ.setdefault("DENO_DIR", "/tmp/vercel-deno-cache")
 
 FFMPEG = imageio_ffmpeg.get_ffmpeg_exe()
-DOWNLOAD_LOCK = threading.Semaphore(1)  # per warm Vercel instance, not global
-MAX_SOURCE_MB = 350  # leave room for MP4 + MP3 + FFmpeg temporary files
+# Vercel Hobby has 1 vCPU and 500 MB shared scratch space per function
+# instance. Two simultaneous MP4 -> MP3 downloads is a starting point.
+# This is *per warm instance*, not a global limit across Vercel.
+def _configured_download_slots():
+    try:
+        return max(1, min(2, int(os.getenv("MAX_CONCURRENT_DOWNLOADS", "2"))))
+    except ValueError:
+        return 2
+
+
+MAX_CONCURRENT_DOWNLOADS = _configured_download_slots()
+DOWNLOAD_SLOTS = threading.BoundedSemaphore(MAX_CONCURRENT_DOWNLOADS)
+ANALYZE_LOCK = threading.BoundedSemaphore(1)
+MAX_SOURCE_MB = 120  # per media file, not a total scratch-space guarantee
+MIN_FREE_TMP_MB = 90  # reserve space for MP3 conversion, thumbnail and Deno
 SUPPORTED_HOSTS = ("youtube.com", "youtu.be", "facebook.com", "fb.watch", "fb.com", "instagram.com")
 
 app = FastAPI(title="Video Downloader — Vercel")
@@ -177,7 +191,7 @@ def format_choices(info):
 
 
 def analyze_sync(url):
-    with DOWNLOAD_LOCK, youtube_cookie_file() as cookies:
+    with ANALYZE_LOCK, youtube_cookie_file() as cookies:
         with yt_dlp.YoutubeDL(ydl_options(cookies)) as ydl:
             info = ydl.extract_info(url, download=False)
         if not info:
@@ -212,7 +226,7 @@ def download_sync(url, format_id, folder: Path):
         # Reject unreasonably large sources before filling serverless disk.
         "max_filesize": MAX_SOURCE_MB * 1024 * 1024,
     })
-    with DOWNLOAD_LOCK, youtube_cookie_file() as cookies:
+    with youtube_cookie_file() as cookies:
         if cookies:
             opts["cookiefile"] = cookies
         with yt_dlp.YoutubeDL(opts) as ydl:
@@ -242,7 +256,7 @@ def download_sync(url, format_id, folder: Path):
         ]
         if cover:
             command += ["-i", str(cover)]
-        command += ["-map", "0:a:0", "-c:a", "libmp3lame", "-b:a", "320k"]
+        command += ["-map", "0:a:0", "-c:a", "libmp3lame", "-b:a", "320k", "-threads:a", "1"]
         if cover:
             command += ["-map", "1:v:0", "-c:v", "mjpeg", "-disposition:v", "attached_pic"]
         command += [
@@ -262,7 +276,25 @@ def download_sync(url, format_id, folder: Path):
         return target, "audio/mpeg", "mp3"
 
 
-def file_stream(path: Path, folder: Path):
+class DownloadLease:
+    """Hold a per-instance slot until the response finishes streaming."""
+    def __init__(self, folder: Path):
+        self.folder = folder
+        self.closed = False
+        self.lock = threading.Lock()
+
+    def close(self):
+        with self.lock:
+            if self.closed:
+                return
+            self.closed = True
+        try:
+            shutil.rmtree(self.folder, ignore_errors=True)
+        finally:
+            DOWNLOAD_SLOTS.release()
+
+
+def file_stream(path: Path, lease: DownloadLease):
     try:
         with path.open("rb") as stream:
             while True:
@@ -271,7 +303,7 @@ def file_stream(path: Path, folder: Path):
                     break
                 yield data
     finally:
-        shutil.rmtree(folder, ignore_errors=True)
+        lease.close()
 
 
 def safe_filename(title: str, suffix: str) -> str:
@@ -281,7 +313,13 @@ def safe_filename(title: str, suffix: str) -> str:
 
 @app.get("/")
 def health():
-    return {"ok": True, "service": "vercel-backend", "ffmpeg": bool(FFMPEG), "deno": DENO.is_file()}
+    return {
+        "ok": True,
+        "service": "vercel-backend",
+        "ffmpeg": bool(FFMPEG),
+        "deno": DENO.is_file(),
+        "maxConcurrentDownloadsPerInstance": MAX_CONCURRENT_DOWNLOADS,
+    }
 
 
 @app.get("/api/health")
@@ -303,19 +341,41 @@ async def api_download(req: DownloadRequest):
     validate_url(req.url)
     if not req.formatId or len(req.formatId) > 500:
         raise HTTPException(400, "Invalid formatId")
-    folder = Path(tempfile.mkdtemp(prefix="yt-job-", dir="/tmp"))
+    # Don't queue unbounded requests in a serverless function: waiting would
+    # consume the function's 5-minute budget without making progress.
+    if not DOWNLOAD_SLOTS.acquire(blocking=False):
+        raise HTTPException(
+            503,
+            "This server instance is processing its maximum of 2 downloads. Try again shortly.",
+            headers={"Retry-After": "10"},
+        )
+    lease = None
     try:
+        # A warm Vercel instance shares its 500 MB /tmp space across requests.
+        if shutil.disk_usage("/tmp").free < MIN_FREE_TMP_MB * 1024 * 1024:
+            raise HTTPException(
+                503, "Not enough temporary disk space for another download.",
+                headers={"Retry-After": "15"},
+            )
+        folder = Path(tempfile.mkdtemp(prefix="yt-job-", dir="/tmp"))
+        lease = DownloadLease(folder)
         path, mime, extension = await asyncio.to_thread(download_sync, req.url, req.formatId, folder)
         filename = safe_filename(req.title, extension)
-        # Explicitly stream responses that can exceed Vercel's buffered
-        # response limit; the generator also cleans up the temporary MP4/MP3.
+        # Keep the slot for the entire streamed response, not only FFmpeg.
+        # Both cleanup paths are idempotent for disconnects and normal responses.
         return StreamingResponse(
-            file_stream(path, folder),
+            file_stream(path, lease),
             media_type=mime,
             headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+            background=BackgroundTask(lease.close),
         )
     except Exception as exc:
-        shutil.rmtree(folder, ignore_errors=True)
+        if lease is not None:
+            lease.close()
+        else:
+            DOWNLOAD_SLOTS.release()
+        if isinstance(exc, HTTPException):
+            raise
         raise failure(exc) from exc
 
 
