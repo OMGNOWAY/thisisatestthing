@@ -21,6 +21,23 @@ A separate FastAPI backend for Vercel. The existing `v2/backend` Render deployme
 
 **Unlike Render, this is a request-based function.** It does not run an always-on queue, background jobs, Playwright or the interactive browser-login endpoint. It uses `/tmp` for transient files and removes them after streaming; you cannot rely on `/tmp` persisting across invocations or instances.
 
+## Concurrent downloads
+
+The backend accepts **up to 2 simultaneous MP4 / MP3 download requests per warm
+Vercel function instance**. The analysis endpoint has a separate
+single-analysis lock. The limit also counts response streaming, so temporary
+files stay reserved until delivered.
+
+- Default: `MAX_CONCURRENT_DOWNLOADS=2` (no environment variable required).
+- For smaller loads, set `MAX_CONCURRENT_DOWNLOADS=1`. Values above 2 are capped at 2 in this deployment because Hobby has 1 vCPU and 500 MB of `/tmp` scratch storage.
+- If both local slots are busy, `POST /api/download` returns HTTP **503** and a **`Retry-After: 10`** header. Clients should retry later instead of continuously resubmitting requests.
+- You can see the configured limit in `GET /api/health`, under `maxConcurrentDownloadsPerInstance`.
+- Vercel **automatically starts additional function instances** as needed. This limit does **not** cap downloads across the entire deployment, nor is it a server-side global rate limit. A database-backed distributed queue or limiter would be needed for a hard global limit.
+- MP4 source files are limited to 120 MiB each, and requests are rejected when `/tmp` has insufficient available space. Source size checks are estimates and cannot guarantee every conversion will fit.
+
+More concurrent conversions consume extra CPU, temporary disk space and bandwidth.
+They may also increase YouTube 429/403 rate-limiting; start small and monitor.
+
 ## Credentials
 
 Set these in **Vercel → Project → Settings → Environment Variables**:
@@ -53,7 +70,7 @@ If the build fails fetching Deno, review the build logs. There is **no automatic
 ## Limits and troubleshooting
 
 - Hobby functions have a 5-minute execution cap with Fluid Compute. Long video downloads or conversion can time out.
-- Temporary disk space is finite; large MP4 sources are restricted to 350 MiB (an approximate yt-dlp source-size limit, not a guaranteed total-disk cap).
+- Temporary disk space is finite; individual source files are restricted to 120 MiB (an approximate yt-dlp source-size limit, not a guaranteed total-disk cap). Two concurrent conversions may still exhaust the 500 MiB scratch space when merging separate video/audio tracks.
 - Vercel can also receive YouTube `HTTP 403` and `HTTP 429`; changing hosting providers does **not** guarantee that these errors disappear.
 - This folder uses direct API calls. `/api/download/jobs` (Render's persistent queue) is intentionally not implemented.
 - Test single short videos and a small MP3 before switching production traffic.
