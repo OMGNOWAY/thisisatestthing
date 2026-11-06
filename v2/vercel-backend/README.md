@@ -23,14 +23,16 @@ A separate FastAPI backend for Vercel. The existing `v2/backend` Render deployme
 
 ## Concurrent downloads
 
-The backend accepts **up to 2 simultaneous MP4 / MP3 download requests per warm
-Vercel function instance**. The analysis endpoint has a separate
-single-analysis lock. The limit also counts response streaming, so temporary
-files stay reserved until delivered.
+The backend accepts the number of simultaneous MP4 / MP3 download requests
+configured by `MAX_CONCURRENT_DOWNLOADS`, **per warm Vercel function instance**.
+The analysis endpoint has a separate single-analysis lock. The download slot
+is occupied throughout response streaming, so temporary files stay reserved
+until delivered.
 
 - Default: `MAX_CONCURRENT_DOWNLOADS=2` (no environment variable required).
-- For smaller loads, set `MAX_CONCURRENT_DOWNLOADS=1`. Values above 2 are capped at 2 in this deployment because Hobby has 1 vCPU and 500 MB of `/tmp` scratch storage.
-- If both local slots are busy, `POST /api/download` returns HTTP **503** and a **`Retry-After: 10`** header. Clients should retry later instead of continuously resubmitting requests.
+- Set `MAX_CONCURRENT_DOWNLOADS` to any positive whole number (for example, `100`). The backend **does not cap this value**. Missing, invalid and non-positive values use the default of `2`.
+- Warning: setting `100` does not guarantee 100 successful simultaneous conversions. Vercel Hobby's CPU and 500 MB of `/tmp` scratch space, function execution time, network and upstream rate limits can fail earlier. A smaller value is strongly recommended.
+- If all configured local slots are busy, `POST /api/download` returns HTTP **503** and a **`Retry-After: 10`** header. Clients should retry later instead of continuously resubmitting requests.
 - You can see the configured limit in `GET /api/health`, under `maxConcurrentDownloadsPerInstance`.
 - Vercel **automatically starts additional function instances** as needed. This limit does **not** cap downloads across the entire deployment, nor is it a server-side global rate limit. A database-backed distributed queue or limiter would be needed for a hard global limit.
 - MP4 source files are limited to 120 MiB each, and requests are rejected when `/tmp` has insufficient available space. Source size checks are estimates and cannot guarantee every conversion will fit.
