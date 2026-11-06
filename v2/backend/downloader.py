@@ -416,7 +416,9 @@ def _build_formats(info: dict, label_suffix: str, is_short: bool = False):
         "ext": "mp3",
         "resolution": "audio only",
         "fps": None,
-        "filesize": audio_size if audio_size > 0 else None,
+        # The file is produced by re-encoding MP4 audio to 320 kbps; source
+        # audio size is not a useful estimate of the resulting MP3 size.
+        "filesize": int((info.get('duration') or 0) * 320_000 / 8) or None,
         "hasVideo": False,
         "hasAudio": True,
         "label": "Audio Only (MP3 320kbps)",
@@ -472,6 +474,16 @@ def analyze_url(url: str):
 MAX_RETRIES = 3
 RETRY_DELAY = 3   # seconds between retries
 
+# MP3 requests intentionally download the *video* in MP4 first.
+# Try a small progressive MP4 to minimize RAM/disk/network overhead.
+# If that is not offered, download separate MP4 video + M4A audio and
+# merge them to MP4 before extracting the MP3.
+MP3_MP4_SOURCES = (
+    "best[ext=mp4][height<=360][vcodec!=none][acodec!=none]/best[ext=mp4][vcodec!=none][acodec!=none]",
+    "bestvideo[ext=mp4][height<=360][vcodec^=avc1]+bestaudio[ext=m4a]",
+    "bestvideo[ext=mp4][vcodec^=avc1]+bestaudio[ext=m4a]",
+)
+
 async def download_video(url: str, format_id: str, output_dir: str):
     _check_youtube_cooldown(detect_platform(url)["platform"])
     job_id = str(uuid.uuid4())
@@ -491,8 +503,12 @@ async def download_video(url: str, format_id: str, output_dir: str):
     opts = _base_opts()
 
     if is_audio_only:
+        if not HAS_FFMPEG:
+            shutil.rmtree(job_dir, ignore_errors=True)
+            raise RuntimeError("FFmpeg is required to extract MP3 from MP4 video.")
         opts.update({
-            'format': 'bestaudio/best',
+            'format': MP3_MP4_SOURCES[0],
+            'merge_output_format': 'mp4',
             'outtmpl': output_template,
         })
         if HAS_FFMPEG:
@@ -529,92 +545,43 @@ async def download_video(url: str, format_id: str, output_dir: str):
 
     platform = detect_platform(url)["platform"]
 
-    # Inspect the formats actually exposed by this video. The previous
-    # fallback forced an HLS format even when no HLS stream existed.
-    def _available_audio_formats():
-        info, using_cookies = _extract_video_info(url, platform)
-        info = info or {}
-        candidates = [
-            f for f in info.get('formats', [])
-            if f.get('format_id')
-            and f.get('acodec') not in (None, 'none')
-            and f.get('vcodec', 'none') == 'none'
-            and f.get('url')
-        ]
-        candidates.sort(
-            key=lambda f: (
-                float(f.get('abr') or f.get('tbr') or 0),
-                float(f.get('asr') or 0),
-            ),
-            reverse=True,
-        )
-        # Try different streams rather than re-requesting the same forbidden
-        # CDN URL. Avoid near-identical formats when possible.
-        distinct = []
-        seen = set()
-        for f in candidates:
-            signature = (f.get('protocol'), f.get('acodec'))
-            if signature in seen:
-                continue
-            seen.add(signature)
-            distinct.append(f)
-        # Other bitrates of the same codec are still valid alternatives.
-        distinct.extend(f for f in candidates if f not in distinct)
-        return [dict(f, _using_cookies=using_cookies) for f in distinct[:3]], len(candidates)
-
-    def _download_once(selected_id, attempt, using_cookies=True):
+    # Let yt-dlp resolve MP4 format selectors on the current request. This
+    # avoids a separate YouTube metadata probe for every MP3 download.
+    def _download_once(selected_format, attempt):
         logger.info("yt-dlp download waiting for worker slot job=%s attempt=%s", job_id, attempt)
         with _DL_SEM:
-            with _cookie_copy(platform if using_cookies else '') as cookie_tmp:
+            with _cookie_copy(platform) as cookie_tmp:
                 run_opts = dict(opts)
-                if selected_id:
-                    run_opts['format'] = selected_id
+                if selected_format:
+                    run_opts['format'] = selected_format
                 _set_cookie_options(run_opts, platform, cookie_tmp)
                 with yt_dlp.YoutubeDL(run_opts) as ydl:
                     if is_audio_only and HAS_FFMPEG:
                         ydl.add_post_processor(_CleanTagsPP(), when='pre_process')
                     ydl.download([url])
 
-    audio_formats = []
-    if platform == 'youtube' and is_audio_only:
-        # Do not hold a worker slot while awaiting a previous download: the
-        # semaphore covers extraction and FFmpeg for each download attempt.
-        try:
-            audio_formats, available_count = await asyncio.to_thread(_available_audio_formats)
-            logger.info(
-                "YouTube audio formats discovered job=%s available=%s attempts=%s",
-                job_id, available_count, len(audio_formats),
-            )
-        except Exception:
-            logger.exception("YouTube audio format inspection failed job=%s", job_id)
-            shutil.rmtree(job_dir, ignore_errors=True)
-            raise
-        if not audio_formats:
-            shutil.rmtree(job_dir, ignore_errors=True)
-            raise RuntimeError(
-                "YouTube did not expose a downloadable audio-only format "
-                "for this video. Check the playback session and yt-dlp configuration."
-            )
-
     last_err = None
     saw_forbidden = False
-    attempts = audio_formats if audio_formats else [None] * MAX_RETRIES
-    for attempt, selected in enumerate(attempts, start=1):
-        selected_id = str(selected['format_id']) if selected else None
-        if selected:
+    # Each alternative produces an MP4 container before FFmpeg extracts MP3.
+    # For ordinary video downloads, retain the existing retry behavior.
+    attempts = MP3_MP4_SOURCES if is_audio_only else (None,) * MAX_RETRIES
+    for attempt, selected_format in enumerate(attempts, start=1):
+        if is_audio_only:
             logger.info(
-                "Audio format selected job=%s attempt=%s id=%s codec=%s "
-                "protocol=%s bitrate_kbps=%s used_cookies=%s",
-                job_id, attempt, selected_id, selected.get('acodec'),
-                selected.get('protocol'), selected.get('abr') or selected.get('tbr'),
-                selected.get('_using_cookies'),
+                "MP3 from MP4 selected job=%s attempt=%s source=%s",
+                job_id, attempt,
+                "progressive MP4" if attempt == 1 else "MP4 video + M4A merge",
             )
         try:
-            await asyncio.to_thread(
-                _download_once, selected_id, attempt,
-                selected.get('_using_cookies', True) if selected else True,
-            )
-            # Return only a finished media file; never a partial download.
+            await asyncio.to_thread(_download_once, selected_format, attempt)
+            # After postprocessing, only serve the requested final file.
+            # Never accidentally return a leftover MP4 instead of an MP3.
+            if is_audio_only:
+                filepath = os.path.join(job_dir, f"{job_id}.mp3")
+                if os.path.isfile(filepath):
+                    logger.info("MP4 to MP3 conversion completed job=%s", job_id)
+                    return filepath
+                raise FileNotFoundError("MP4 downloaded, but MP3 extraction did not finish")
             for fname in os.listdir(job_dir):
                 full = os.path.join(job_dir, fname)
                 if (os.path.isfile(full)
@@ -634,7 +601,7 @@ async def download_video(url: str, format_id: str, output_dir: str):
             unavailable = "Requested format is not available" in message
             logger.warning(
                 "Download attempt failed job=%s attempt=%s format=%s reason=%s",
-                job_id, attempt, selected_id or "default",
+                job_id, attempt, "mp4-video" if is_audio_only else "default",
                 "HTTP 403" if forbidden else "format unavailable" if unavailable else type(exc).__name__,
             )
             # Remove partial files before attempting an alternative.
@@ -644,8 +611,8 @@ async def download_video(url: str, format_id: str, output_dir: str):
                 except OSError:
                     pass
             if platform == 'youtube' and is_audio_only:
-                # Only retry a different format on a rejected or unavailable
-                # stream. Other errors should surface immediately.
+                # Try another MP4 source only if the previous stream is
+                # rejected or missing. Do not repeatedly retry other errors.
                 if not (forbidden or unavailable):
                     break
                 continue
@@ -658,13 +625,13 @@ async def download_video(url: str, format_id: str, output_dir: str):
     _check_youtube_cooldown(platform)
     if saw_forbidden:
         raise RuntimeError(
-            "YouTube refused the available audio stream(s) (HTTP 403). "
-            "This may be an upstream access restriction, not an MP3 conversion problem."
+            "YouTube refused the selected MP4 video/audio stream(s) (HTTP 403). "
+            "This is an upstream access restriction, not an MP3 conversion problem."
         ) from last_err
     if platform == 'youtube' and is_audio_only and last_err and (
         "Requested format is not available" in str(last_err)
     ):
         raise RuntimeError(
-            "YouTube's advertised audio formats became unavailable during download."
+            "YouTube did not offer a compatible MP4 source for MP3 conversion."
         ) from last_err
     raise RuntimeError(f"Download failed: {last_err}") from last_err
