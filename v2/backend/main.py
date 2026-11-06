@@ -18,7 +18,7 @@ from starlette.background import BackgroundTask
 
 from downloader import (
     analyze_url, download_video, save_cookies, clear_cookies, cookies_info,
-    mark_auth_expired,
+    mark_auth_expired, log_downloader_runtime,
 )
 from google_login import LoginError, start_interactive_setup
 import git_auth_sync
@@ -168,6 +168,7 @@ download_queue = DownloadQueue()
 
 @app.on_event("startup")
 async def restore_youtube_auth():
+    log_downloader_runtime()
     await download_queue.start()
     logger.info("Download queue started workers=%s", download_queue.workers)
     if not git_auth_sync.enabled():
