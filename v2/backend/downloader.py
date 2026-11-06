@@ -194,6 +194,48 @@ def _cookie_copy(platform: str):
             pass
 
 
+def _set_cookie_options(opts: dict, platform: str, cookie_tmp: str | None) -> None:
+    """Use supported player clients for logged-in YouTube sessions."""
+    if not cookie_tmp:
+        return
+    opts['cookiefile'] = cookie_tmp
+    if platform == 'youtube' and not _PLAYER_CLIENTS:
+        # yt-dlp issue #17389: the default authenticated tv_downgraded
+        # client can fail to return playable player responses.
+        opts['extractor_args'] = {
+            'youtube': {'player_client': ['default', 'web_embedded']}
+        }
+
+
+def _extract_video_info(url: str, platform: str) -> tuple[dict | None, bool]:
+    """Try stored cookies first, then guest access for public YouTube videos.
+
+    A loaded cookie file is not evidence that YouTube will accept that session.
+    Only retry an anonymous extraction when the authenticated player did not
+    return any player response; never silently retry login-required content.
+    """
+    with _cookie_copy(platform) as cookie_tmp:
+        opts = _base_opts()
+        _set_cookie_options(opts, platform, cookie_tmp)
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                return ydl.extract_info(url, download=False), bool(cookie_tmp)
+        except Exception as exc:
+            if not (
+                platform == 'youtube'
+                and cookie_tmp
+                and 'Failed to extract any player response' in str(exc)
+            ):
+                raise
+            logger.warning(
+                "Authenticated YouTube player returned no response; "
+                "retrying public metadata without account cookies"
+            )
+
+    with yt_dlp.YoutubeDL(_base_opts()) as ydl:
+        return ydl.extract_info(url, download=False), False
+
+
 # ─── Platform Detection ───────────────────────────────────────────────
 
 def detect_platform(url: str) -> dict:
@@ -304,29 +346,26 @@ def analyze_url(url: str):
     }
     is_short = platform == "youtube" and content_type == "short"
 
-    with _cookie_copy(platform) as cookie_tmp:
-        opts = _base_opts()
-        if cookie_tmp:
-            opts['cookiefile'] = cookie_tmp
-
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            try:
-                info = ydl.extract_info(url, download=False)
-                if not info:
-                    return None
-                formats = _build_formats(info, label_map[platform], is_short=is_short)
-                logger.info("yt-dlp analysis completed platform=%s formats=%s", platform, len(formats))
-                return {
-                    "platform": platform,
-                    "contentType": content_type,
-                    "title": info.get('title'),
-                    "thumbnailUrl": info.get('thumbnail'),
-                    "durationSeconds": info.get('duration'),
-                    "formats": formats,
-                }
-            except Exception as e:
-                logger.exception("yt-dlp analysis failed platform=%s url=%s", platform, _url_for_log(url))
-                raise Exception(f"Failed to analyze URL: {e}")
+    try:
+        info, using_cookies = _extract_video_info(url, platform)
+        if not info:
+            return None
+        formats = _build_formats(info, label_map[platform], is_short=is_short)
+        logger.info(
+            "yt-dlp analysis completed platform=%s formats=%s used_cookies=%s",
+            platform, len(formats), using_cookies,
+        )
+        return {
+            "platform": platform,
+            "contentType": content_type,
+            "title": info.get('title'),
+            "thumbnailUrl": info.get('thumbnail'),
+            "durationSeconds": info.get('duration'),
+            "formats": formats,
+        }
+    except Exception as e:
+        logger.exception("yt-dlp analysis failed platform=%s url=%s", platform, _url_for_log(url))
+        raise Exception(f"Failed to analyze URL: {e}") from e
 
 
 # ─── Download ─────────────────────────────────────────────────────────
@@ -393,12 +432,8 @@ async def download_video(url: str, format_id: str, output_dir: str):
     # Inspect the formats actually exposed by this video. The previous
     # fallback forced an HLS format even when no HLS stream existed.
     def _available_audio_formats():
-        with _cookie_copy(platform) as cookie_tmp:
-            probe_opts = _base_opts()
-            if cookie_tmp:
-                probe_opts['cookiefile'] = cookie_tmp
-            with yt_dlp.YoutubeDL(probe_opts) as probe:
-                info = probe.extract_info(url, download=False) or {}
+        info, using_cookies = _extract_video_info(url, platform)
+        info = info or {}
         candidates = [
             f for f in info.get('formats', [])
             if f.get('format_id')
@@ -425,17 +460,16 @@ async def download_video(url: str, format_id: str, output_dir: str):
             distinct.append(f)
         # Other bitrates of the same codec are still valid alternatives.
         distinct.extend(f for f in candidates if f not in distinct)
-        return distinct[:3], len(candidates)
+        return [dict(f, _using_cookies=using_cookies) for f in distinct[:3]], len(candidates)
 
-    def _download_once(selected_id, attempt):
+    def _download_once(selected_id, attempt, using_cookies=True):
         logger.info("yt-dlp download waiting for worker slot job=%s attempt=%s", job_id, attempt)
         with _DL_SEM:
-            with _cookie_copy(platform) as cookie_tmp:
+            with _cookie_copy(platform if using_cookies else '') as cookie_tmp:
                 run_opts = dict(opts)
                 if selected_id:
                     run_opts['format'] = selected_id
-                if cookie_tmp:
-                    run_opts['cookiefile'] = cookie_tmp
+                _set_cookie_options(run_opts, platform, cookie_tmp)
                 with yt_dlp.YoutubeDL(run_opts) as ydl:
                     if is_audio_only and HAS_FFMPEG:
                         ydl.add_post_processor(_CleanTagsPP(), when='pre_process')
@@ -470,12 +504,16 @@ async def download_video(url: str, format_id: str, output_dir: str):
         if selected:
             logger.info(
                 "Audio format selected job=%s attempt=%s id=%s codec=%s "
-                "protocol=%s bitrate_kbps=%s",
+                "protocol=%s bitrate_kbps=%s used_cookies=%s",
                 job_id, attempt, selected_id, selected.get('acodec'),
                 selected.get('protocol'), selected.get('abr') or selected.get('tbr'),
+                selected.get('_using_cookies'),
             )
         try:
-            await asyncio.to_thread(_download_once, selected_id, attempt)
+            await asyncio.to_thread(
+                _download_once, selected_id, attempt,
+                selected.get('_using_cookies', True) if selected else True,
+            )
             # Return only a finished media file; never a partial download.
             for fname in os.listdir(job_dir):
                 full = os.path.join(job_dir, fname)
