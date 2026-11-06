@@ -39,14 +39,16 @@ if DENO.is_file():
 os.environ.setdefault("DENO_DIR", "/tmp/vercel-deno-cache")
 
 FFMPEG = imageio_ffmpeg.get_ffmpeg_exe()
-# Vercel Hobby has 1 vCPU and 500 MB shared scratch space per function
-# instance. Two simultaneous MP4 -> MP3 downloads is a starting point.
-# This is *per warm instance*, not a global limit across Vercel.
+# This is a per-warm-instance limit, not a deployment-wide limit.
+# Use the positive integer from the environment as-is, without an upper cap.
+# Vercel's CPU, memory, scratch space and YouTube rate limits may become the
+# actual bottleneck well before the configured concurrency is reached.
 def _configured_download_slots():
     try:
-        return max(1, min(2, int(os.getenv("MAX_CONCURRENT_DOWNLOADS", "2"))))
+        value = int(os.getenv("MAX_CONCURRENT_DOWNLOADS", "2"))
     except ValueError:
         return 2
+    return value if value >= 1 else 2
 
 
 MAX_CONCURRENT_DOWNLOADS = _configured_download_slots()
