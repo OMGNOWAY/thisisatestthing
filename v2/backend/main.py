@@ -19,6 +19,7 @@ from starlette.background import BackgroundTask
 from downloader import (
     analyze_url, download_video, save_cookies, clear_cookies, cookies_info,
     mark_auth_expired, log_downloader_runtime,
+    YouTubeRateLimited, youtube_retry_after, detect_platform,
 )
 from google_login import LoginError, start_interactive_setup
 import git_auth_sync
@@ -156,6 +157,8 @@ class DownloadQueue:
                 job["error"] = (
                     "YouTube authentication has expired. Re-authentication is required."
                     if needs_signin(exc)
+                    else str(exc)
+                    if isinstance(exc, YouTubeRateLimited)
                     else "YouTube refused the audio download (HTTP 403). Please try again later."
                     if "403" in str(exc)
                     else "Download failed. Please try again."
@@ -204,6 +207,7 @@ async def queue_download(req: DownloadRequest, request: Request):
     if not req.formatId:
         raise HTTPException(status_code=400, detail="URL and formatId are required")
     validate_public_url(req.url)
+    check_upstream_youtube_cooldown(req.url)
     return await download_queue.add(req)
 
 
@@ -352,6 +356,17 @@ def needs_signin(err: Exception) -> bool:
     msg = str(err).lower()
     return "not a bot" in msg or "cookies are no longer valid" in msg
 
+def check_upstream_youtube_cooldown(url: str):
+    if detect_platform(url)["platform"] == "youtube":
+        remaining = youtube_retry_after()
+        if remaining:
+            raise HTTPException(
+                status_code=503,
+                detail="YouTube is temporarily rate-limiting this server. Please try again later.",
+                headers={"Retry-After": str(remaining)},
+            )
+
+
 async def run_analyze(url: str):
     logger.info("Analyze waiting for slot url=%s", url_for_log(url))
     async with analyze_semaphore:
@@ -364,6 +379,7 @@ async def run_analyze(url: str):
 async def api_analyze(req: AnalyzeRequest, request: Request):
     check_rate_limit(request)
     validate_public_url(req.url)
+    check_upstream_youtube_cooldown(req.url)
     logger.info("Analyze started url=%s", url_for_log(req.url))
     try:
         data = await run_analyze(req.url)
@@ -371,6 +387,8 @@ async def api_analyze(req: AnalyzeRequest, request: Request):
             raise HTTPException(status_code=400, detail="Could not extract metadata from this URL")
         logger.info("Analyze completed url=%s formats=%s", url_for_log(req.url), len(data.get("formats", [])))
         return data
+    except YouTubeRateLimited as exc:
+        raise HTTPException(status_code=503, detail=str(exc), headers={"Retry-After": str(exc.retry_after)})
     except asyncio.TimeoutError:
         logger.warning("Analyze timed out url=%s", url_for_log(req.url))
         raise HTTPException(status_code=408, detail="Analysis timed out. Please try again.")
@@ -395,6 +413,7 @@ async def api_download(req: DownloadRequest, request: Request):
     if not req.formatId:
         raise HTTPException(status_code=400, detail="URL and formatId are required")
     validate_public_url(req.url)
+    check_upstream_youtube_cooldown(req.url)
     logger.info("Direct download started url=%s", url_for_log(req.url))
 
     try:
@@ -421,6 +440,8 @@ async def api_download(req: DownloadRequest, request: Request):
             }
         )
 
+    except YouTubeRateLimited as exc:
+        raise HTTPException(status_code=503, detail=str(exc), headers={"Retry-After": str(exc.retry_after)})
     except asyncio.TimeoutError:
         logger.warning("Direct download timed out url=%s", url_for_log(req.url))
         raise HTTPException(status_code=408, detail="Download timed out (5 min limit). Try a lower quality.")
