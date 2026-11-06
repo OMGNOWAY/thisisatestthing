@@ -13,6 +13,24 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import app as backend
 
 
+class EnvironmentLimitTests(unittest.TestCase):
+    def test_env_value_100_is_not_capped(self):
+        with patch.dict(backend.os.environ, {"MAX_CONCURRENT_DOWNLOADS": "100"}):
+            self.assertEqual(backend._configured_download_slots(), 100)
+
+    def test_env_value_1(self):
+        with patch.dict(backend.os.environ, {"MAX_CONCURRENT_DOWNLOADS": "1"}):
+            self.assertEqual(backend._configured_download_slots(), 1)
+
+    def test_invalid_env_values_use_default(self):
+        for value in ("0", "-5", "invalid", ""):
+            with self.subTest(value=value), patch.dict(
+                backend.os.environ, {"MAX_CONCURRENT_DOWNLOADS": value}
+            ):
+                self.assertEqual(backend._configured_download_slots(), 2)
+
+
+
 class DownloadConcurrencyTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.slots_patch = patch.object(backend, "DOWNLOAD_SLOTS", threading.BoundedSemaphore(2))
