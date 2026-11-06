@@ -381,6 +381,12 @@ async def api_analyze(req: AnalyzeRequest, request: Request):
         if needs_signin(e):
             mark_auth_expired()
             raise HTTPException(status_code=401, detail="YouTube authentication has expired. Re-authentication is required.")
+        if "Failed to extract any player response" in str(e):
+            raise HTTPException(
+                status_code=502,
+                detail="YouTube did not return player information to this server. "
+                       "Check the yt-dlp/EJS diagnostics in Render logs.",
+            )
         raise HTTPException(status_code=400, detail="Could not analyze the provided URL.")
 
 @app.post("/api/download")
