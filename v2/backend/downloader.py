@@ -88,6 +88,61 @@ _NO_CHECK_CERT = os.getenv("YTDLP_NO_CHECK_CERTIFICATE", "").strip().lower() in 
 _PLAYER_CLIENTS = [c.strip() for c in os.getenv("YTDLP_PLAYER_CLIENTS", "").split(",") if c.strip()]
 
 
+
+def _cooldown_seconds_config():
+    try:
+        return max(60, min(int(os.getenv("YOUTUBE_429_COOLDOWN_SECONDS", "900")), 3600))
+    except ValueError:
+        return 900
+
+
+_YT_COOLDOWN_SECONDS = _cooldown_seconds_config()
+_YT_COOLDOWN_LOCK = threading.Lock()
+_YT_COOLDOWN_UNTIL = 0.0
+
+
+class YouTubeRateLimited(RuntimeError):
+    def __init__(self, retry_after):
+        self.retry_after = retry_after
+        super().__init__(f"YouTube temporarily rate-limited this server. Try again in {retry_after} seconds.")
+
+
+def youtube_retry_after():
+    with _YT_COOLDOWN_LOCK:
+        remaining = _YT_COOLDOWN_UNTIL - time.monotonic()
+    return max(0, int(remaining + 0.999))
+
+
+def _record_youtube_429(message):
+    if "HTTP Error 429" not in message and "429: Too Many Requests" not in message:
+        return
+    global _YT_COOLDOWN_UNTIL
+    with _YT_COOLDOWN_LOCK:
+        _YT_COOLDOWN_UNTIL = max(_YT_COOLDOWN_UNTIL, time.monotonic() + _YT_COOLDOWN_SECONDS)
+    logger.warning("YouTube HTTP 429: pausing requests for %ss", _YT_COOLDOWN_SECONDS)
+
+
+def _check_youtube_cooldown(platform):
+    if platform == 'youtube':
+        seconds = youtube_retry_after()
+        if seconds:
+            raise YouTubeRateLimited(seconds)
+
+
+class _YtDlpLog:
+    """Observe yt-dlp HTTP warnings without logging signed media URLs."""
+    def debug(self, message):
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug("%s", message)
+
+    def warning(self, message):
+        _record_youtube_429(message)
+        logger.warning("yt-dlp: %s", re.sub(r'https?://\S+', '[url]', message))
+
+    def error(self, message):
+        logger.error("yt-dlp: %s", re.sub(r'https?://\S+', '[url]', message))
+
+
 def _base_opts() -> dict:
     """Return a fresh copy of base yt-dlp options (never mutate the global)."""
     opts = {
@@ -95,6 +150,7 @@ def _base_opts() -> dict:
         # Important for diagnosing extractor failures: missing JavaScript
         # challenge scripts and rejected player clients are warning-only.
         'no_warnings': False,
+        'logger': _YtDlpLog(),
         'nocheckcertificate': _NO_CHECK_CERT,
         'ignoreerrors': False,
         'extract_flat': False,
@@ -249,6 +305,7 @@ def _extract_video_info(url: str, platform: str) -> tuple[dict | None, bool]:
     Only retry an anonymous extraction when the authenticated player did not
     return any player response; never silently retry login-required content.
     """
+    _check_youtube_cooldown(platform)
     with _cookie_copy(platform) as cookie_tmp:
         opts = _base_opts()
         _set_cookie_options(opts, platform, cookie_tmp)
@@ -256,6 +313,8 @@ def _extract_video_info(url: str, platform: str) -> tuple[dict | None, bool]:
             with yt_dlp.YoutubeDL(opts) as ydl:
                 return ydl.extract_info(url, download=False), bool(cookie_tmp)
         except Exception as exc:
+            _record_youtube_429(str(exc))
+            _check_youtube_cooldown(platform)
             if not (
                 platform == 'youtube'
                 and cookie_tmp
@@ -267,6 +326,7 @@ def _extract_video_info(url: str, platform: str) -> tuple[dict | None, bool]:
                 "retrying public metadata without account cookies"
             )
 
+    _check_youtube_cooldown(platform)
     with yt_dlp.YoutubeDL(_base_opts()) as ydl:
         return ydl.extract_info(url, download=False), False
 
@@ -398,7 +458,11 @@ def analyze_url(url: str):
             "durationSeconds": info.get('duration'),
             "formats": formats,
         }
+    except YouTubeRateLimited:
+        raise
     except Exception as e:
+        _record_youtube_429(str(e))
+        _check_youtube_cooldown(platform)
         logger.exception("yt-dlp analysis failed platform=%s url=%s", platform, _url_for_log(url))
         raise Exception(f"Failed to analyze URL: {e}") from e
 
@@ -409,6 +473,7 @@ MAX_RETRIES = 3
 RETRY_DELAY = 3   # seconds between retries
 
 async def download_video(url: str, format_id: str, output_dir: str):
+    _check_youtube_cooldown(detect_platform(url)["platform"])
     job_id = str(uuid.uuid4())
     job_dir = os.path.join(output_dir, job_id)
     os.makedirs(job_dir, exist_ok=True)
@@ -560,6 +625,10 @@ async def download_video(url: str, format_id: str, output_dir: str):
         except Exception as exc:
             last_err = exc
             message = str(exc)
+            _record_youtube_429(message)
+            if platform == 'youtube' and youtube_retry_after():
+                logger.warning('Stopping download retries due to YouTube HTTP 429')
+                break
             forbidden = "HTTP Error 403" in message or "403: Forbidden" in message
             saw_forbidden = saw_forbidden or forbidden
             unavailable = "Requested format is not available" in message
@@ -586,6 +655,7 @@ async def download_video(url: str, format_id: str, output_dir: str):
                 await asyncio.sleep(RETRY_DELAY * attempt)
 
     shutil.rmtree(job_dir, ignore_errors=True)
+    _check_youtube_cooldown(platform)
     if saw_forbidden:
         raise RuntimeError(
             "YouTube refused the available audio stream(s) (HTTP 403). "
