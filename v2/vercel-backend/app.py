@@ -346,7 +346,7 @@ async def api_download(req: DownloadRequest):
     if not DOWNLOAD_SLOTS.acquire(blocking=False):
         raise HTTPException(
             503,
-            "This server instance is processing its maximum of 2 downloads. Try again shortly.",
+            f"This server instance is processing its maximum of {MAX_CONCURRENT_DOWNLOADS} downloads. Try again shortly.",
             headers={"Retry-After": "10"},
         )
     lease = None
