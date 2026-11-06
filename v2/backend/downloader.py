@@ -9,12 +9,45 @@ import contextlib
 import tempfile
 import re
 import logging
+from importlib.metadata import PackageNotFoundError, version as package_version
 from yt_dlp.postprocessor.common import PostProcessor
 
 import google_login
 import git_auth_sync
 
 logger = logging.getLogger("video_downloader.downloader")
+
+
+def log_downloader_runtime() -> None:
+    """Log safe runtime diagnostics without printing cookies or signed URLs."""
+    try:
+        yt_version = package_version("yt-dlp")
+    except PackageNotFoundError:
+        yt_version = getattr(yt_dlp.version, "__version__", "unknown")
+    try:
+        ejs_version = package_version("yt-dlp-ejs")
+    except PackageNotFoundError:
+        ejs_version = "missing"
+    logger.info(
+        "YouTube runtime yt_dlp=%s yt_dlp_ejs=%s deno_installed=%s "
+        "ffmpeg_installed=%s player_client_override=%s",
+        yt_version,
+        ejs_version,
+        bool(shutil.which("deno")),
+        HAS_FFMPEG,
+        ",".join(_PLAYER_CLIENTS) if _PLAYER_CLIENTS else "none",
+    )
+    if ejs_version == "missing":
+        logger.warning(
+            "yt-dlp-ejs is not installed; the current YouTube player "
+            "JavaScript challenges may fail. Rebuild yt-dlp[default]."
+        )
+    if not shutil.which("deno"):
+        logger.warning(
+            "Deno is not available; yt-dlp may be unable to solve "
+            "YouTube JavaScript challenges."
+        )
+
 
 
 def _url_for_log(url: str) -> str:
@@ -59,7 +92,9 @@ def _base_opts() -> dict:
     """Return a fresh copy of base yt-dlp options (never mutate the global)."""
     opts = {
         'quiet': True,
-        'no_warnings': True,
+        # Important for diagnosing extractor failures: missing JavaScript
+        # challenge scripts and rejected player clients are warning-only.
+        'no_warnings': False,
         'nocheckcertificate': _NO_CHECK_CERT,
         'ignoreerrors': False,
         'extract_flat': False,
